@@ -8,22 +8,24 @@ from pylab import *
 from mpi4py import MPI
 import time
 from mpi.wrappyfftw import *
-
-from commandline import *
+from utilities.commandline import *
 
 params = {
-    'M': 6,
-    'temporal': 'RK4',
+    'M': 8,
+    'temporal': 'PD8',
     'plot_result': 10,         # Show an image every..
     'nu': 0.001,
-    'dt': 0.005,
-    'T': 50.0,
-    'problem': 'Taylor-Green',
-    'debug': False
+    'dt': 0.05,
+    'T': 10.0,
+    'problem': 'vortices',
+    'debug': False,
+    'errtol': 1.e-5,
+    'make_plots': True
 }
+
 commandline_kwargs = parse_command_line(sys.argv[1:])
 params.update(commandline_kwargs)
-assert params['temporal'] in ['RK4', 'ForwardEuler', 'AB2']
+#assert params['temporal'] in ['RK4', 'ForwardEuler', 'AB2', 'BS5']
 vars().update(params)
 
 # Set the size of the doubly periodic box N**2
@@ -44,9 +46,6 @@ X = mgrid[rank*Np:(rank+1)*Np, :N].astype(float)*L/N
 Nf = N/2+1
 Npf = Np/2+1 if rank+1 == num_processes else Np/2
 
-U     = empty((2, Np, N))
-U_hat = empty((2, N, Npf), dtype="complex")
-P     = empty((Np, N))
 P_hat = empty((N, Npf), dtype="complex")
 curl   = empty((Np, N))
 Uc_hat = empty((N, Npf), dtype="complex")
@@ -59,25 +58,25 @@ fft_y = empty(N, dtype="complex")
 fft_x = empty(N, dtype="complex")
 plane_recv = empty(Np, dtype="complex")
 
-# RK4 arrays
 U_hat0 = empty((2, N, Npf), dtype="complex")
-U_hat1 = empty((2, N, Npf), dtype="complex")
 dU     = empty((2, N, Npf), dtype="complex")
 
-# Set wavenumbers in grid
-kx = fftfreq(N, 1./N)
-ky = kx[:Nf].copy(); ky[-1] *= -1
-K = array(meshgrid(kx, ky[rank*Np/2:(rank*Np/2+Npf)], indexing='ij'), dtype=int)
-K2 = sum(K*K, 0)
-K_over_K2 = array(K, dtype=float) / where(K2==0, 1, K2)
+if temporal == 'RK4':
+    U_hat1 = empty((2, N, Npf), dtype="complex")
+    a = array([1./6., 1./3., 1./3., 1./6.])
+    b = array([0.5, 0.5, 1.])
+elif temporal in ['ForwardEuler', 'AB2']:
+    pass
+else: #Embedded Runge-Kutta pair from nodepy
+    from nodepy import rk
+    myrk = rk.loadRKM(temporal)
+    A = myrk.A.astype(float)
+    b = myrk.b.astype(float)
+    b_hat = myrk.bhat.astype(float)
+    U_hat1 = empty((2, N, Npf), dtype="complex")
+    U_hat2 = empty((2, N, Npf), dtype="complex")
+    U_hat_stages = empty((len(myrk), 2, N, Npf), dtype="complex")
 
-# Filter for dealiasing nonlinear convection
-kmax = 2./3.*(N/2+1)
-dealias = array((abs(K[0]) < kmax)*(abs(K[1]) < kmax), dtype=bool)
-
-# RK4 parameters
-a = array([1./6., 1./3., 1./3., 1./6.])*dt
-b = array([0.5, 0.5, 1.])*dt
 
 def project(u):
     u[:] -= sum(K*u, 0)*K_over_K2    
@@ -143,7 +142,7 @@ def irfft2_mpi(fu, u):
     u[:] = irfft(Uc_hatT, 1)
     return u
 
-def ComputeRHS(dU, rk):
+def ComputeRHS(U_hat, dU, rk):
     if rk > 0: # For rk=0 the correct values are already in U, V, W
         U[0] = irfft2_mpi(U_hat[0], U[0])
         U[1] = irfft2_mpi(U_hat[1], U[1])
@@ -164,35 +163,84 @@ def ComputeRHS(dU, rk):
     # Add contribution from diffusion
     dU[:] -= nu*K2*U_hat
 
-if problem == 'Taylor-Green':
-    U[0] = sin(X[0])*cos(X[1])
-    U[1] =-cos(X[0])*sin(X[1])
-elif problem == 'vortices':
-    w =     exp(-((X[0]-pi)**2+(X[1]-pi+pi/4)**2)/(0.2)) \
-       +    exp(-((X[0]-pi)**2+(X[1]-pi-pi/4)**2)/(0.2)) \
-       -0.5*exp(-((X[0]-pi-pi/4)**2+(X[1]-pi-pi/4)**2)/(0.4))
-    w_hat = U_hat[0].copy()
-    w_hat = rfft2_mpi(w, w_hat)
-    U[0] = irfft2_mpi(1j*K_over_K2[1]*w_hat, U[0])
-    U[1] = irfft2_mpi(-1j*K_over_K2[0]*w_hat, U[1])
 
-# Transform initial data
-U_hat[0] = rfft2_mpi(U[0], U_hat[0])
-U_hat[1] = rfft2_mpi(U[1], U_hat[1])
+def wavenumbers(N,Np):
+    Nf = N/2+1
+    Npf = Np/2+1 if rank+1 == num_processes else Np/2
+    # Set wavenumbers in grid
+    kx = fftfreq(N, 1./N)
+    ky = kx[:Nf].copy(); ky[-1] *= -1
+    K = array(meshgrid(kx, ky[rank*Np/2:(rank*Np/2+Npf)], indexing='ij'), dtype=int)
+    K2 = sum(K*K, 0)
+    K_over_K2 = array(K, dtype=float) / where(K2==0, 1, K2)
 
-# Make it divergence free in case it is not
-project(U_hat)
+    # Filter for dealiasing nonlinear convection
+    kmax = 2./3.*(N/2+1)
+    dealias = array((abs(K[0]) < kmax)*(abs(K[1]) < kmax), dtype=bool)
 
-# initialize plot and list k for storing energy
-im = plt.imshow(zeros((N, N)))
-plt.colorbar(im)
-plt.draw()
+    return K, K2, K_over_K2, dealias
+
+
+def initial_data(problem,N,Np):
+    Npf = Np/2+1 if rank+1 == num_processes else Np/2
+    U     = empty((2, Np, N))
+    U_hat = empty((2, N, Npf), dtype="complex")
+    if problem == 'Taylor-Green':
+        U[0] = sin(X[0])*cos(X[1])
+        U[1] =-cos(X[0])*sin(X[1])
+    elif problem == 'vortices':
+        w =     exp(-((X[0]-pi)**2+(X[1]-pi+pi/4)**2)/(0.2)) \
+           +    exp(-((X[0]-pi)**2+(X[1]-pi-pi/4)**2)/(0.2)) \
+           -0.5*exp(-((X[0]-pi-pi/4)**2+(X[1]-pi-pi/4)**2)/(0.4))
+        w_hat = U_hat[0].copy()
+        w_hat = rfft2_mpi(w, w_hat)
+        U[0] = irfft2_mpi( 1j*K_over_K2[1]*w_hat, U[0])
+        U[1] = irfft2_mpi(-1j*K_over_K2[0]*w_hat, U[1])
+    elif problem =='double-shear':
+        assert nu == 1.e-4
+        delta = 1./200
+        sigma = 15/pi
+        x, y = X[0], X[1]
+        w = (delta * cos(x) - sigma/(cosh(sigma*(y-pi/2)))**2) * (y<=pi)
+        w +=(delta * cos(x) + sigma/(cosh(sigma*(3*pi/2-y)))**2) * (y>pi)
+        w_hat = U_hat[0].copy()
+        w_hat = rfft2_mpi(w, w_hat)
+        U[0] = irfft2_mpi( 1j*K_over_K2[1]*w_hat, U[0])
+        U[1] = irfft2_mpi(-1j*K_over_K2[0]*w_hat, U[1])
+        
+
+
+    # Transform initial data
+    U_hat[0] = rfft2_mpi(U[0], U_hat[0])
+    U_hat[1] = rfft2_mpi(U[1], U_hat[1])
+
+    # Make it divergence free in case it is not
+    project(U_hat)
+
+    return U, U_hat
+
+
+def plot_vorticity(U_hat, K, curl, im, t):
+        curl = irfft2_mpi(1j*K[0]*U_hat[1]-1j*K[1]*U_hat[0], curl)
+        im.set_data(flipud(curl[:, :].T))
+        im.autoscale()
+        plt.title('time %s' % str(t))
+
+
+K, K2, K_over_K2, dealias = wavenumbers(N,Np)
+
+U, U_hat = initial_data(problem, N, Np)
+
+if make_plots:
+    # initialize plot
+    im = plt.imshow(zeros((N, N)))
+    plt.colorbar(im)
+    plt.draw()
 
 tic = time.time()
 t = 0.0
 tstep = 0
 
-# RK4 loop in time
 t0 = time.time()
 while t < T:
     t += dt; tstep += 1
@@ -200,32 +248,61 @@ while t < T:
     if temporal == 'RK4':
         U_hat1[:] = U_hat0[:] = U_hat
         for rk in range(4):
-            ComputeRHS(dU, rk)
+            ComputeRHS(U_hat, dU, rk)
             if rk < 3:
                 #U_hat[:] = U_hat0 + b[rk]*dU
-                U_hat[:] = U_hat0; U_hat += b[rk]*dU # Faster (no tmp array)
-            U_hat1[:] += a[rk]*dU
+                U_hat[:] = U_hat0; U_hat += b[rk]*dt*dU # Faster (no tmp array)
+            U_hat1[:] += a[rk]*dt*dU
         U_hat[:] = U_hat1[:]
 
-    elif temporal == 'ForwardEuler' or tstep == 1:
-        ComputeRHS(dU, 0)
+    elif temporal == 'ForwardEuler' or (tstep == 1 and temporal == 'AB2'):
+        ComputeRHS(U_hat, dU, 0)
         U_hat[:] += dU*dt
         if temporal == "AB2":
             U_hat0[:] = dU*dt
 
-    else:
-        ComputeRHS(dU, 0)
+    elif temporal == 'AB2':
+        ComputeRHS(U_hat, dU, 0)
         U_hat[:] += (1.5*dU*dt - 0.5*U_hat0)
         U_hat0[:] = dU*dt
+
+    else:
+        s = len(b)
+        U_hat2[:] = U_hat1[:] = U_hat0[:] = U_hat
+        for i in range(s):
+            U_hat_stages[i][:] = U_hat
+        for i in range(s):
+            ComputeRHS(U_hat_stages[i], dU, i)
+            for j in range(i,s):
+                U_hat_stages[j] += A[j,i]*dt*dU
+            U_hat1[:] += b[i]*dt*dU
+            U_hat2[:] += b_hat[i]*dt*dU
+
+        err_est = linalg.norm(U_hat2.ravel() - U_hat1.ravel())
+
+        if err_est > errtol:
+            t -= dt
+            if debug:
+                print 'last step rejected'
+        else:
+            U_hat[:] = U_hat1[:]
+
+        p = myrk.p; facmax = 2.; facmin = 0.2; kappa = 0.95
+        alpha = 0.7/p
+        facopt = (errtol/(err_est+1.e-6*errtol))**alpha 
+        dt = dt * min(facmax,max(facmin,kappa*facopt))
+        if debug:
+            print tstep, t, err_est, dt
+        
+
+
 
     for i in range(2): 
         U[i] = irfft2_mpi(U_hat[i], U[i])
 
     # From here on it's only postprocessing
-    if tstep % plot_result == 0:
-        curl = irfft2_mpi(1j*K[0]*U_hat[1]-1j*K[1]*U_hat[0], curl)
-        im.set_data(curl[:, :])
-        im.autoscale()
+    if tstep % plot_result == 0 and make_plots:
+        plot_vorticity(U_hat, K, curl, im, t)
         plt.pause(1e-6)
 
     if problem == 'Taylor-Green':
@@ -235,8 +312,10 @@ while t < T:
             print tstep, time.time()-t0, kk
     t0 = time.time()
 
+
 if rank == 0:
     print "Time = ", time.time()-tic
+    print "# of steps: ", tstep
 #plt.figure()
 #plt.quiver(X[0,::2,::2], X[1,::2,::2], U[0,::2,::2], U[1,::2,::2], pivot='mid', scale=2)
 #plt.draw();plt.show()
@@ -247,9 +326,11 @@ def regression_test(problem='vortices'):
     if rank!=0:
         return True
     if problem == 'vortices':
-        U_ref = np.loadtxt('vortices.txt')
-        assert np.allclose(U[0], U_ref)
-    else:
+        if M==6 and T==50:
+            U_ref = np.loadtxt('vortices.txt')
+            diff = np.linalg.norm(U[0]-U_ref)
+            assert np.allclose(U[0], U_ref), str(diff)
+    elif problem == 'Taylor-Green':
         # Check accuracy. Only for Taylor Green
         u0 = sin(X[0])*cos(X[1])*exp(-2.*nu*t)
         u1 =-sin(X[1])*cos(X[0])*exp(-2.*nu*t)
